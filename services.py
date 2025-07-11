@@ -4,12 +4,13 @@ import httpx
 import asyncio
 import joblib
 import logging
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from config import GCS_BUCKET_NAME, POSE_API_URL, BALL_API_URL
 from gcs_utils import upload_video_to_gcs
 from Drawingfunction import render_video_with_pose_and_max_ball_speed, save_specific_frames
-from KinematicsModulev2 import extract_pitching_biomechanics
-from ClassificationModelv2 import classify_pitch_quality
+from KinematicsModule import extract_pitching_biomechanics
+from PoseClassification import calculate_score_from_comparison
 from BallClassification import classify_ball_quality
 from typing import Dict, Optional, Tuple
 import crud
@@ -21,33 +22,21 @@ ball_prediction_model = joblib.load('random_forest_model.pkl')
 
 # 取得比較模型 輸入資料庫 比較對象 球路 返回比較標準模型
 def get_comparison_model(db: Session, benchmark_player_name: str, detected_pitch_type: str):
-    """
-    【修改後的輔助函式】
-    透過 crud.py 智慧地從資料庫中尋找最適合的比對模型。
-    """
     profile_model = None
-    
-    # 1. 如果偵測到的球種有效，優先嘗試尋找最精準的模型 (投手 + 球種)
     if detected_pitch_type and detected_pitch_type != "Unknown":
-        # 組合出與 buildModel.py 完全一致的模型名稱
         ideal_model_name = f"{benchmark_player_name}_{detected_pitch_type}_v1"
         logger.info(f"服務層：正在嘗試載入球種專屬模型: {ideal_model_name}")
         profile_model = crud.get_pitch_model_by_name(db, model_name=ideal_model_name)
         if profile_model:
             return profile_model
 
-    # 2. 如果找不到專屬模型，或球種未知，則嘗試尋找該投手的「通用」模型作為備案
     fallback_model_name = f"{benchmark_player_name}_all_v1"
     logger.warning(f"找不到或未指定專屬模型，嘗試載入通用模型: {fallback_model_name}")
     profile_model = crud.get_pitch_model_by_name(db, model_name=fallback_model_name)
-
     return profile_model
 
 # 分析生物力學特徵函數 輸入影片 返回 運動力學特徵 骨架
 async def analyze_video_kinematics(video_bytes: bytes, filename: str) -> Tuple[Dict, Dict]:
-    """
-    呼叫 Pose API，計算生物力學特徵，並同時回傳原始 pose_data 以供畫圖使用。
-    """
     logger.info("服務層：(子任務) 正在呼叫 POSE API...")
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
         files = {"file": (filename, video_bytes, "video/mp4")}
@@ -57,52 +46,7 @@ async def analyze_video_kinematics(video_bytes: bytes, filename: str) -> Tuple[D
     logger.info("服務層：(子任務) 正在計算生物力學特徵...")
     biomechanics_features = extract_pitching_biomechanics(pose_data)
     return biomechanics_features, pose_data
-
-# 評分函數 輸入運動力學特徵 評判標準資料 輸出分數
-def calculate_score_from_comparison(features: dict, profile_data: dict) -> int:
-    """
-    【新的評分函式】
-    根據使用者的特徵與標準模型的差距，計算出一個 0-100 的分數。
-    差距越小，分數越高。
-    """
-    if not profile_data:
-        return 0 # 如果沒有模型可以比對，分數為 0
-
-    total_score = 0
-    feature_count = 0
-
-    for key, user_value in features.items():
-        # 只比對在模型中有定義的特徵
-        profile_stats = profile_data.get(key.lower())
-        if not profile_stats or user_value is None:
-            continue
-        
-        mean = profile_stats.get('mean')
-        std = profile_stats.get('std')
-
-        # 確保模型中有 mean 和 std，且 std 不為 0
-        if mean is None or std is None or std == 0:
-            continue
-
-        # 計算 Z-score，代表偏離了幾個標準差
-        z_score = abs((user_value - mean) / std)
-        
-        # 將 Z-score 轉換為 0-100 的分數
-        # 這裡使用一個簡單的轉換：Z-score 為 0 (完全符合平均) 得 100 分
-        # Z-score 每增加 1 (偏離一個標準差)，就扣 25 分 (可調整)
-        # 最低為 0 分
-        feature_score = max(0, 100 - z_score * 25)
-        
-        total_score += feature_score
-        feature_count += 1
     
-    if feature_count == 0:
-        return 0
-
-    # 回傳所有特徵的平均分數
-    final_score = int(total_score / feature_count)
-    return final_score
-
 # 棒球軌跡分析函數 輸入影片輸出球路軌跡
 async def analyze_ball_flight(video_bytes: bytes, filename: str) -> Dict:
     """
@@ -120,8 +64,11 @@ async def analyze_pitch_service(
         db,
         video_file, 
         player_name,
-        benchmark_player_name=None
+        benchmark_name,
+        compare_average: bool
         ):
+    
+    logger.info(f"[服務層] 收到參數: player_name='{player_name}', benchmark_name='{benchmark_name}', compare_average={compare_average}") # 偵錯日誌
     
     # 步驟 1 嘗試暫存原始影片
     temp_video_path = f"temp_{video_file.filename}"
@@ -152,21 +99,43 @@ async def analyze_pitch_service(
     # 從球路資料拿到pitch_type
     detected_pitch_type = ball_data.get("predicted_pitch_type",None)
     
-    # 決定投手分數的比較標準
-    comparison_target_name = benchmark_player_name if benchmark_player_name else player_name
-    profile_model = get_comparison_model(db, comparison_target_name, detected_pitch_type)
+    # 步驟 3: 決定比較標竿並取得模型
+    # 建立一個列表來存放所有要比對的模型
+    benchmark_profiles_to_return = []
 
-    # 利用比對標準和運動力學特徵來計算投手分數
-    pitch_score = 0
-    profile_data_for_frontend = None
-    if profile_model:
-        profile_data_for_frontend = profile_model.profile_data
-        pitch_score = calculate_score_from_comparison(
+    # 處理菁英選手模型
+    if benchmark_name:
+        elite_model = crud.get_pitch_model_by_name(db, model_name=benchmark_name)
+        if elite_model:
+            benchmark_profiles_to_return.append(elite_model)
+
+    # 如果勾選了，處理個人歷史平均模型
+    if compare_average:
+        current_time = datetime.now(timezone.utc)
+        user_average_model = crud.calculate_user_average_profile(db, player_name, end_date=current_time)
+        if user_average_model:
+            benchmark_profiles_to_return.append(user_average_model)
+
+    # 使用第一個模型（通常是菁英模型）來計算主要分數
+    pose_score = 0
+    pose_score_details = {}
+    pose_score_message = "分析成功" # 預設訊息
+
+    if benchmark_profiles_to_return:
+        main_profile_data = benchmark_profiles_to_return[0].profile_data
+        if main_profile_data:
+            pose_score, pose_score_details = calculate_score_from_comparison(
                 features=biomechanics_features,
-                profile_data=profile_data_for_frontend
+                profile_data=main_profile_data
             )
+        else:
+            # 雖然有模型，但模型沒有資料的情況
+            pose_score_message = "比對模型資料不完整"
+            logger.warning(f"服務層：模型 {benchmark_profiles_to_return[0].model_name} 資料不完整。")
     else:
-        logger.warning(f"在資料庫中找不到任何可用的比對模型 (比對對象: {comparison_target_name})，pitch_score 將設為 0。")
+        # 【建議優化】: 在找不到模型時，更新訊息內容
+        pose_score_message = "未選擇或找不到比對模型"
+        logger.warning(f"服務層：找不到任何比對模型，pose_score 設為 0。")
 
     # 計算投球分數
     ball_score = classify_ball_quality(ball_data, ball_prediction_model)
@@ -244,20 +213,61 @@ async def analyze_pitch_service(
     except Exception as e:
         logger.warning(f"刪除暫存影片失敗: {e}", exc_info=True)
 
-    # 返回分析結果
-    return {
+    # 步驟 6: 組裝一個「扁平化」的字典，用來存入資料庫
+    data_for_db = {
         "output_video_url": gcs_video_url,
+        "player_name": player_name,
         "max_speed_kmh": max_speed_kmh,
-        "pitch_score": pitch_score,
+        "pose_score": pose_score,
         "ball_score": ball_score,
-        "detected_pitch_type": detected_pitch_type,
         "biomechanics_features": biomechanics_features,
-        "pitcher_name": player_name,
         "release_frame_url": release_frame_url,
         "landing_frame_url": landing_frame_url,
         "shoulder_frame_url": shoulder_frame_url,
-        "model_profile": {
-            "model_name": profile_model.model_name if profile_model else "N/A",
-            "profile_data": profile_data_for_frontend
-            },
+        "pose_score_message": pose_score_message
     }
+
+    # 步驟 7: 將本次分析結果存入資料庫
+    try:
+        created_record_from_db = crud.create_pitch_analysis(
+            db=db,
+            analysis_data=data_for_db
+        )
+        new_record_id = created_record_from_db.id
+        new_record_created_at = created_record_from_db.created_at.isoformat()
+        logger.info(f"成功將分析結果 (ID: {new_record_id}) 存入資料庫。")
+    except Exception as e:
+        logger.error(f"服務層：分析結果存入資料庫失敗: {e}", exc_info=True)
+        new_record_id = None
+        new_record_created_at = None
+
+    final_response_package = {
+        "new_record": {
+            "id": new_record_id,
+            "created_at": new_record_created_at,
+            "player_name": player_name,
+            "video_path": gcs_video_url,
+            "keyframe_urls": {
+                "release_frame_url": release_frame_url,
+                "landing_frame_url": landing_frame_url,
+                "shoulder_frame_url": shoulder_frame_url
+            },
+            "predictions": {
+                "max_speed_kmh": max_speed_kmh,
+                "pose_score": pose_score,
+                "ball_score": ball_score,
+                "pose_score_details": pose_score_details,
+                "pose_score_message": pose_score_message 
+            },
+            "biomechanics_features": biomechanics_features
+        },
+        "benchmark_profiles": [
+            {
+                "model_name": p.model_name,
+                "display_name": p.display_name if hasattr(p, 'display_name') else p.model_name,
+                "profile_data": p.profile_data
+            } for p in benchmark_profiles_to_return
+        ]
+    }
+
+    return final_response_package

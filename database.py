@@ -54,15 +54,17 @@ class PitchAnalyses(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     video_path = Column(String, index=True)
-    pitcher_name = Column(String, index=True)
+    player_name = Column(String, index=True)
     max_speed_kmh = Column(Float)
-    pitch_score = Column(Integer)
+    pose_score = Column(Integer)
     ball_score = Column(Float)
     biomechanics_features = Column(JSON)
     release_frame_url = Column(String, index=True)
     landing_frame_url = Column(String, index=True)
     shoulder_frame_url = Column(String, index=True)
-
+    pose_score_message = Column(String, default="分析成功")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
 # 表四：儲存計算後的統計模型
 class PitchModel(Base):
     __tablename__ = 'pitch_model'

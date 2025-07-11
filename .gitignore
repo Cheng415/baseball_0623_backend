@@ -1,2 +1,60 @@
-"service-account-key.json" 
-"service-account-key.json" 
+# -------------------------
+# Service Account Keys & Secrets
+# 服務帳號金鑰與機密檔案 (非常重要！)
+# -------------------------
+service-account-key.json
+*.json
+.env
+
+
+# -------------------------
+# Python Virtual Environment
+# Python 虛擬環境
+# -------------------------
+/venv/
+/env/
+.venv/
+env/
+venv/
+env.bak/
+venv.bak/
+
+
+# -------------------------
+# Python Cache & Compiled files
+# Python 的快取與編譯檔案
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+# -------------------------
+# Editor & IDE specific folders
+# 開發工具產生的設定資料夾
+# -------------------------
+.vscode/
+.idea/
+
+
+# -------------------------
+# OS-specific files
+# 作業系統產生的暫存檔
+# -------------------------
+.DS_Store
+Thumbs.db
+
+
+# -------------------------
+# Build artifacts
+# 專案打包後的產出物
+# -------------------------
+/dist/
+/build/
+*.egg-info/
+
+# -------------------------
+# Media files (如果您的影片檔是暫存的)
+# -------------------------
+*.mp4
